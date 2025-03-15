@@ -1,0 +1,98 @@
+FROM ubuntu:latest AS conflux
+
+# # Define build arguments for Conflux node configuration
+ARG CONFLUX_ROOT="/opt/conflux"
+
+# Install necessary dependencies and clean up apt lists to reduce image size
+RUN apt-get update && apt-get install -y --no-install-recommends \ 
+        git \
+        sudo \
+        ca-certificates \
+        curl \
+        unzip \
+        sqlite3 \
+        tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${CONFLUX_ROOT} /workspaces
+
+# Set environment variables for chain IDs and configuration paths
+ENV CONFLUX_ROOT=${CONFLUX_ROOT}
+# Define build arguments for user creation
+ARG USERNAME=ubuntu
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# Add utility scripts and templates to the image
+
+# Create a new user if $USERNAME doesn't exist
+RUN id -u $USERNAME >/dev/null 2>&1 || (groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USERNAME -m -s /bin/bash $USERNAME)
+
+# Configure passwordless sudo for the created user
+RUN echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# Change ownership of the Conflux node directory to the created user
+RUN chown -R ${USERNAME}:${USERNAME} ${CONFLUX_ROOT} /workspaces
+
+# Expose necessary ports for the Conflux node
+EXPOSE 12535 12537 8545 8546
+
+# Switch to the created user context
+USER $USERNAME 
+
+FROM conflux AS devkit-vscode
+ 
+# Set the working directory for the user
+WORKDIR /workspaces/
+
+# Set additional environment variables for the user
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    EDITOR=code \
+    VISUAL=code \
+    GIT_EDITOR="code --wait"
+
+FROM devkit-vscode AS devkit-nvm
+USER root
+RUN mkdir /opt/nvm
+ENV NVM_DIR=/opt/nvm
+ENV NODE_VERSION=v22.12.0
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+RUN /bin/bash -c "source $NVM_DIR/nvm.sh && nvm install $NODE_VERSION && nvm use --delete-prefix $NODE_VERSION"
+ENV NODE_PATH=$NVM_DIR/versions/node/$NODE_VERSION/bin
+ENV PATH=$NODE_PATH:$PATH
+USER $USERNAME
+
+
+FROM devkit-nvm AS devkit-hardhat
+USER $USERNAME
+RUN npm install -g npm@latest
+RUN npm install -g pnpm@latest-10
+RUN npm install --global hardhat-shorthand \
+    && yes | hardhat-completion install
+
+FROM devkit-hardhat AS devkit-hardhat-core
+RUN printf '%s\n' \
+'if [ -t 0 ] && [ -z "${HARDHAT_VAR_DEPLOYER_ACCOUNT_CORE}" ]; then' \
+'    HARDHAT_VAR_DEPLOYER_ACCOUNT_CORE=$(devkit wallet private-key --core)' \
+'    if [ $? -eq 0 ] && [ -n "${HARDHAT_VAR_DEPLOYER_ACCOUNT_CORE}" ]; then' \
+'        export HARDHAT_VAR_DEPLOYER_ACCOUNT_CORE' \
+'    else' \
+'        echo "Failed to retrieve mnemonic or mnemonic is empty" >&2' \
+'    fi' \
+'fi' >> /home/${USERNAME}/.bashrc
+RUN echo "alias hardhat-var-update='export HARDHAT_VAR_DEPLOYER_ACCOUNT_CORE=\"\$(devkit wallet private-key --core)\"'" >> ~/.bash_aliases
+
+FROM devkit-hardhat AS devkit-hardhat-espace
+RUN printf '%s\n' \
+'if [ -t 0 ] && [ -z "${HARDHAT_VAR_DEPLOYER_MNEMONIC}" ]; then' \
+'    HARDHAT_VAR_DEPLOYER_MNEMONIC=$(devkit wallet show)' \
+'    if [ $? -eq 0 ] && [ -n "${HARDHAT_VAR_DEPLOYER_MNEMONIC}" ]; then' \
+'        export HARDHAT_VAR_DEPLOYER_MNEMONIC' \
+'    else' \
+'        echo "Failed to retrieve mnemonic or mnemonic is empty" >&2' \
+'    fi' \
+'fi' >> /home/${USERNAME}/.bashrc
+RUN echo "alias hardhat-var-update='export HARDHAT_VAR_DEPLOYER_MNEMONIC=\"\$(devkit wallet show)\"'" >> ~/.bash_aliases
